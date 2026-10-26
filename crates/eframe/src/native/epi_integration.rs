@@ -30,12 +30,12 @@ pub fn viewport_builder(
     // Always use the default window size / position on iOS. Trying to restore the previous position
     // causes the window to be shown too small.
     #[cfg(not(target_os = "ios"))]
-    let inner_size_points = if let Some(window_settings) = window_settings {
+    if let Some(window_settings) = window_settings {
         // Restore pos/size from previous session
 
         if clamp_size_to_monitor_size {
             window_settings.clamp_size_to_sane_values(largest_monitor_point_size(
-                egui_zoom_factor,
+                window_settings.zoom_factor(egui_zoom_factor),
                 event_loop,
             ));
         }
@@ -43,7 +43,6 @@ pub fn viewport_builder(
 
         viewport_builder =
             window_settings.initialize_viewport_builder(egui_zoom_factor, viewport_builder);
-        Some(window_settings.inner_size_points())
     } else {
         if let Some(pos) = viewport_builder.position {
             viewport_builder = viewport_builder.with_position(pos);
@@ -57,9 +56,7 @@ pub fn viewport_builder(
             );
             viewport_builder = viewport_builder.with_inner_size(initial_window_size);
         }
-
-        viewport_builder.inner_size
-    };
+    }
 
     #[cfg(not(target_os = "ios"))]
     if native_options.centered {
@@ -71,7 +68,9 @@ pub fn viewport_builder(
             let monitor_size = monitor
                 .size()
                 .to_logical::<f32>(egui_zoom_factor as f64 * monitor.scale_factor());
-            let inner_size = inner_size_points.unwrap_or(egui::Vec2 { x: 800.0, y: 600.0 });
+            let inner_size = viewport_builder
+                .inner_size
+                .unwrap_or(egui::Vec2 { x: 800.0, y: 600.0 });
             if 0.0 < monitor_size.width && 0.0 < monitor_size.height {
                 let x = (monitor_size.width - inner_size.x) * 0.5;
                 let y = (monitor_size.height - inner_size.y) * 0.5;
@@ -199,7 +198,7 @@ pub struct EpiIntegration {
     /// Settings the root window was restored with, for the parts applied when it is first shown.
     restored_window_settings: Option<WindowSettings>,
 
-    /// Normal (non-maximized) geometry of the root window, as last saved.
+    /// Latest normal (non-maximized) geometry of the root window.
     #[cfg(feature = "persistence")]
     normal_geometry: Option<egui_winit::WindowGeometry>,
 
@@ -265,7 +264,13 @@ impl EpiIntegration {
             });
         }
 
-        let restored_window_settings = load_window_settings(frame.storage());
+        let restored_window_settings = load_window_settings(frame.storage()).or_else(|| {
+            WindowSettings::requested_at_start(
+                egui_ctx.zoom_factor(),
+                window,
+                &native_options.viewport,
+            )
+        });
         #[cfg(feature = "persistence")]
         let normal_geometry = restored_window_settings
             .map(|settings| settings.normal_geometry())
@@ -322,6 +327,25 @@ impl EpiIntegration {
         }
 
         egui_winit.on_window_event(window, event)
+    }
+
+    /// Remember normal geometry while the user resizes or moves, before a maximize/fullscreen
+    /// command can replace it. Waiting for the next autosave loses the latest normal rectangle.
+    pub fn track_window_geometry(&mut self, window: &winit::window::Window) {
+        #[cfg(feature = "persistence")]
+        if self.persist_window
+            && window.is_visible() != Some(false)
+            && window.is_minimized() != Some(true)
+            && !window.is_maximized()
+            && window.fullscreen().is_none()
+        {
+            self.normal_geometry = Some(egui_winit::WindowGeometry::from_window(
+                self.egui_ctx.zoom_factor(),
+                window,
+            ));
+        }
+        #[cfg(not(feature = "persistence"))]
+        let _ = window;
     }
 
     pub fn pre_update(&mut self) {

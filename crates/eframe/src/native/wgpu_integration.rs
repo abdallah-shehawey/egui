@@ -1071,6 +1071,9 @@ impl WgpuWinitRunning<'_> {
         let event_response = viewport_id
             .and_then(|viewport_id| {
                 let viewport = shared.viewports.get_mut(&viewport_id)?;
+                if viewport_id == ViewportId::ROOT {
+                    integration.track_window_geometry(viewport.window.as_deref()?);
+                }
                 Some(integration.on_window_event(
                     viewport.window.as_deref()?,
                     viewport.egui_winit.as_mut()?,

@@ -26,6 +26,11 @@ pub struct WindowGeometry {
 
     /// Inner size of window in points.
     inner_size_points: egui::Vec2,
+
+    /// Interface zoom used for `inner_size_points`. Older settings did not store it and
+    /// relied on egui memory restoring the same zoom before the window was created.
+    #[cfg_attr(feature = "serde", serde(default))]
+    zoom_factor: Option<f32>,
 }
 
 impl WindowGeometry {
@@ -40,6 +45,7 @@ impl WindowGeometry {
             scale_factor,
             inner_size_points: egui::vec2(inner_size.width as f32, inner_size.height as f32)
                 / (egui_zoom_factor * scale_factor),
+            zoom_factor: Some(egui_zoom_factor),
         }
     }
 }
@@ -57,6 +63,41 @@ pub struct WindowSettings {
 }
 
 impl WindowSettings {
+    /// The state explicitly requested for a first launch, before anything has been persisted.
+    /// X11 needs maximize/fullscreen requests repeated after mapping even in this case.
+    pub fn requested_at_start(
+        egui_zoom_factor: f32,
+        window: &winit::window::Window,
+        viewport: &ViewportBuilder,
+    ) -> Option<Self> {
+        let maximized = viewport.maximized.unwrap_or(false);
+        let fullscreen = viewport.fullscreen.unwrap_or(false);
+        if !maximized && !fullscreen {
+            return None;
+        }
+        let mut normal_geometry = WindowGeometry::from_window(egui_zoom_factor, window);
+        if let Some(size) = viewport.inner_size {
+            normal_geometry.inner_size_points = size;
+        }
+        if let Some(position) = viewport.position {
+            normal_geometry.outer_position_pixels =
+                Some(position * (egui_zoom_factor * normal_geometry.scale_factor));
+        }
+        Some(Self {
+            normal_geometry,
+            fullscreen,
+            maximized,
+        })
+    }
+
+    /// Zoom in which the saved inner size is expressed, with compatibility for old settings.
+    pub fn zoom_factor(&self, fallback: f32) -> f32 {
+        self.normal_geometry
+            .zoom_factor
+            .filter(|z| z.is_finite() && (0.01..=100.0).contains(z))
+            .unwrap_or(fallback)
+    }
+
     /// While maximized or fullscreen, keeps `last_normal_geometry`, so the window restores to it.
     pub fn from_window(
         egui_zoom_factor: f32,
@@ -66,7 +107,7 @@ impl WindowSettings {
         let fullscreen = window.fullscreen().is_some();
         let maximized = window.is_maximized();
         let normal_geometry = last_normal_geometry
-            .filter(|_| fullscreen || maximized)
+            .filter(|_| fullscreen || maximized || window.is_minimized() == Some(true))
             .unwrap_or_else(|| WindowGeometry::from_window(egui_zoom_factor, window));
         Self {
             normal_geometry,
@@ -101,7 +142,9 @@ impl WindowSettings {
                 viewport_builder.with_position(pos / (egui_zoom_factor * geometry.scale_factor));
         }
 
-        viewport_builder = viewport_builder.with_inner_size(geometry.inner_size_points);
+        viewport_builder = viewport_builder.with_inner_size(
+            geometry.inner_size_points * (self.zoom_factor(egui_zoom_factor) / egui_zoom_factor),
+        );
         if PLACE_AFTER_CREATION {
             // Moving a maximized or fullscreen window resets it,
             // so `initialize_window` maximizes or enters fullscreen after moving.
@@ -194,6 +237,7 @@ impl WindowSettings {
         egui_zoom_factor: f32,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) {
+        let egui_zoom_factor = self.zoom_factor(egui_zoom_factor);
         // If the app last ran on two monitors and only one is now connected, then
         // the given position is invalid.
         // If this happens on Mac, a maximized window gets zero size, so we drop the position.
@@ -312,4 +356,54 @@ fn clamp_pos_to_monitors(
     // subtract the size of the window to get the bottom right most value window.position
     // can have.
     *position_px = position_px.clamp(monitor_rect.min, monitor_rect.min + window_size);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(zoom: Option<f32>) -> WindowSettings {
+        WindowSettings {
+            normal_geometry: WindowGeometry {
+                outer_position_pixels: Some(egui::pos2(120.0, 90.0)),
+                scale_factor: 1.5,
+                inner_size_points: egui::vec2(800.0, 600.0),
+                zoom_factor: zoom,
+            },
+            maximized: false,
+            fullscreen: false,
+        }
+    }
+
+    #[test]
+    fn saved_size_survives_a_different_startup_zoom() {
+        for saved_zoom in [0.75, 1.0, 1.25, 1.5, 2.0, 3.0] {
+            for startup_zoom in [0.75, 1.0, 1.5, 2.0] {
+                let builder = settings(Some(saved_zoom))
+                    .initialize_viewport_builder(startup_zoom, ViewportBuilder::default());
+                let logical = builder.inner_size.unwrap() * startup_zoom;
+                assert!((logical - egui::vec2(800.0, 600.0) * saved_zoom).length() < 0.001);
+                assert!(
+                    (builder.position.unwrap() * startup_zoom - egui::pos2(80.0, 60.0)).length()
+                        < 0.001
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn old_or_invalid_zoom_keeps_the_previous_restore_semantics() {
+        for zoom in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+            Some(f32::MAX),
+        ] {
+            let builder =
+                settings(zoom).initialize_viewport_builder(1.5, ViewportBuilder::default());
+            assert_eq!(builder.inner_size, Some(egui::vec2(800.0, 600.0)));
+        }
+    }
 }

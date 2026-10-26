@@ -1110,6 +1110,9 @@ impl GlowWinitRunning<'_> {
                 if let (Some(window), Some(egui_winit)) =
                     (&viewport.window, &mut viewport.egui_winit)
                 {
+                    if viewport_id == ViewportId::ROOT {
+                        self.integration.track_window_geometry(window);
+                    }
                     event_response = self.integration.on_window_event(window, egui_winit, event);
                 }
             } else {
