@@ -596,6 +596,7 @@ impl WgpuWinitRunning<'_> {
 
         self.integration.egui_ctx.on_exit();
         self.save();
+        self.integration.close_storage();
 
         #[cfg(feature = "glow")]
         self.app.on_exit(None);
@@ -1189,7 +1190,8 @@ fn create_window(
 ) -> Result<(Window, ViewportBuilder), winit::error::OsError> {
     profiling::function_scope!();
 
-    let mut window_settings = epi_integration::load_window_settings(storage);
+    let mut window_settings =
+        epi_integration::load_window_settings(native_options.persist_window, storage);
     let viewport_builder = epi_integration::viewport_builder(
         egui_ctx.zoom_factor(),
         event_loop,
