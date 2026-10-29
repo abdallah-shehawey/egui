@@ -332,6 +332,7 @@ impl EpiIntegration {
     pub fn track_window_geometry(&mut self, window: &winit::window::Window) {
         #[cfg(feature = "persistence")]
         if self.persist_window
+            && window.is_visible() != Some(false)
             && let Some(geometry) =
                 egui_winit::WindowGeometry::from_normal_window(self.egui_ctx.zoom_factor(), window)
         {

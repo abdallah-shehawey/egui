@@ -34,14 +34,14 @@ pub struct WindowGeometry {
 }
 
 impl WindowGeometry {
-    /// Capture only a visible, normal window. On Windows the native show state can change
-    /// before winit's cached maximized flag is updated by the subsequent `WM_SIZE` message.
+    /// Capture a normal, non-minimized window, including a hidden window's startup geometry.
+    /// On Windows the native show state can change before winit's cached maximized flag is
+    /// updated by the subsequent `WM_SIZE` message.
     pub fn from_normal_window(
         egui_zoom_factor: f32,
         window: &winit::window::Window,
     ) -> Option<Self> {
-        (window.is_visible() != Some(false)
-            && window.is_minimized() != Some(true)
+        (window.is_minimized() != Some(true)
             && !is_maximized(window)
             && window.fullscreen().is_none())
         .then(|| Self::from_window(egui_zoom_factor, window))
@@ -460,9 +460,16 @@ mod tests {
                     .create_window(
                         Window::default_attributes()
                             .with_title("egui normal geometry regression")
+                            .with_visible(false)
                             .with_inner_size(winit::dpi::LogicalSize::new(640.0, 480.0)),
                     )
                     .unwrap();
+                self.geometry = WindowGeometry::from_normal_window(1.5, &window);
+                assert!(
+                    self.geometry.is_some(),
+                    "a hidden normal window must seed startup geometry"
+                );
+                window.set_visible(true);
                 window.request_redraw();
                 self.window = Some(window);
             }
