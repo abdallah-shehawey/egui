@@ -276,10 +276,7 @@ impl EpiIntegration {
         let normal_geometry = restored_window_settings
             .map(|settings| settings.normal_geometry())
             .or_else(|| {
-                // Nothing saved yet, so use the window's own geometry, unless it starts maximized:
-                (!window.is_maximized() && window.fullscreen().is_none()).then(|| {
-                    egui_winit::WindowGeometry::from_window(egui_ctx.zoom_factor(), window)
-                })
+                egui_winit::WindowGeometry::from_normal_window(egui_ctx.zoom_factor(), window)
             });
 
         Self {
@@ -335,15 +332,10 @@ impl EpiIntegration {
     pub fn track_window_geometry(&mut self, window: &winit::window::Window) {
         #[cfg(feature = "persistence")]
         if self.persist_window
-            && window.is_visible() != Some(false)
-            && window.is_minimized() != Some(true)
-            && !window.is_maximized()
-            && window.fullscreen().is_none()
+            && let Some(geometry) =
+                egui_winit::WindowGeometry::from_normal_window(self.egui_ctx.zoom_factor(), window)
         {
-            self.normal_geometry = Some(egui_winit::WindowGeometry::from_window(
-                self.egui_ctx.zoom_factor(),
-                window,
-            ));
+            self.normal_geometry = Some(geometry);
         }
         #[cfg(not(feature = "persistence"))]
         let _ = (self, window);

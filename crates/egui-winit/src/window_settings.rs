@@ -34,6 +34,19 @@ pub struct WindowGeometry {
 }
 
 impl WindowGeometry {
+    /// Capture only a visible, normal window. On Windows the native show state can change
+    /// before winit's cached maximized flag is updated by the subsequent `WM_SIZE` message.
+    pub fn from_normal_window(
+        egui_zoom_factor: f32,
+        window: &winit::window::Window,
+    ) -> Option<Self> {
+        (window.is_visible() != Some(false)
+            && window.is_minimized() != Some(true)
+            && !is_maximized(window)
+            && window.fullscreen().is_none())
+        .then(|| Self::from_window(egui_zoom_factor, window))
+    }
+
     pub fn from_window(egui_zoom_factor: f32, window: &winit::window::Window) -> Self {
         let scale_factor = window.scale_factor() as f32;
         let inner_size = window.inner_size();
@@ -48,6 +61,43 @@ impl WindowGeometry {
             zoom_factor: Some(egui_zoom_factor),
         }
     }
+}
+
+/// winit emits Moved from `WM_WINDOWPOSCHANGED` before `DefWindowProc` sends `WM_SIZE`,
+/// where its cached maximized flag is updated. Read the native state during that interval
+/// so a maximized rectangle cannot overwrite the last normal one.
+fn is_maximized(window: &winit::window::Window) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+        use windows_sys::Win32::Foundation::{POINT, RECT};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowPlacement, SW_SHOWMAXIMIZED, WINDOWPLACEMENT,
+        };
+
+        if let Ok(RawWindowHandle::Win32(handle)) = window.window_handle().map(|h| h.as_raw()) {
+            let mut placement = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                flags: 0,
+                showCmd: 0,
+                ptMinPosition: POINT { x: 0, y: 0 },
+                ptMaxPosition: POINT { x: 0, y: 0 },
+                rcNormalPosition: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+            };
+            // SAFETY: the borrowed window owns this HWND and placement is a correctly sized,
+            // initialized output buffer, valid for the duration of the synchronous call.
+            #[expect(unsafe_code)]
+            if unsafe { GetWindowPlacement(handle.hwnd.get() as _, &raw mut placement) } != 0 {
+                return placement.showCmd == SW_SHOWMAXIMIZED as u32;
+            }
+        }
+    }
+    window.is_maximized()
 }
 
 /// Can be used to store native window settings (position and size).
@@ -105,7 +155,7 @@ impl WindowSettings {
         last_normal_geometry: Option<WindowGeometry>,
     ) -> Self {
         let fullscreen = window.fullscreen().is_some();
-        let maximized = window.is_maximized();
+        let maximized = is_maximized(window);
         let normal_geometry = last_normal_geometry
             .filter(|_| fullscreen || maximized || window.is_minimized() == Some(true))
             .unwrap_or_else(|| WindowGeometry::from_window(egui_zoom_factor, window));
@@ -373,6 +423,124 @@ mod tests {
             maximized: false,
             fullscreen: false,
         }
+    }
+
+    /// Exercise the native title-bar maximize message, including Moved before `WM_SIZE`.
+    /// Programmatic maximization inside a winit callback buffers those events and hides the race.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_title_bar_maximize_preserves_normal_geometry() {
+        use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PostMessageW, SC_MAXIMIZE, SC_RESTORE, WM_SYSCOMMAND,
+        };
+        use winit::{
+            application::ApplicationHandler,
+            event::WindowEvent,
+            event_loop::{ActiveEventLoop, EventLoop},
+            platform::{
+                pump_events::EventLoopExtPumpEvents as _, windows::EventLoopBuilderExtWindows as _,
+            },
+            window::{Window, WindowId},
+        };
+
+        #[derive(Default)]
+        struct Probe {
+            window: Option<Window>,
+            geometry: Option<WindowGeometry>,
+            expected: Option<egui::Vec2>,
+            phase: u8,
+            saw_stale_flag: bool,
+            complete: bool,
+        }
+
+        impl ApplicationHandler for Probe {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                let window = event_loop
+                    .create_window(
+                        Window::default_attributes()
+                            .with_title("egui normal geometry regression")
+                            .with_inner_size(winit::dpi::LogicalSize::new(640.0, 480.0)),
+                    )
+                    .unwrap();
+                window.request_redraw();
+                self.window = Some(window);
+            }
+
+            fn window_event(
+                &mut self,
+                event_loop: &ActiveEventLoop,
+                _: WindowId,
+                event: WindowEvent,
+            ) {
+                let window = self.window.as_ref().unwrap();
+                if self.phase == 1 && is_maximized(window) && !window.is_maximized() {
+                    self.saw_stale_flag = true;
+                }
+                if let Some(geometry) = WindowGeometry::from_normal_window(1.5, window) {
+                    self.geometry = Some(geometry);
+                }
+                if event != WindowEvent::RedrawRequested {
+                    return;
+                }
+                let command = match self.phase {
+                    0 => {
+                        self.expected = self.geometry.map(|g| g.inner_size_points);
+                        assert!(self.expected.is_some());
+                        self.phase = 1;
+                        Some(SC_MAXIMIZE)
+                    }
+                    1 if is_maximized(window) => {
+                        assert_eq!(
+                            self.geometry.unwrap().inner_size_points,
+                            self.expected.unwrap()
+                        );
+                        let saved = WindowSettings::from_window(1.5, window, self.geometry);
+                        assert!(saved.maximized);
+                        let reopened =
+                            saved.initialize_viewport_builder(1.0, ViewportBuilder::default());
+                        assert_eq!(reopened.inner_size, self.expected.map(|size| size * 1.5));
+                        self.phase = 2;
+                        Some(SC_RESTORE)
+                    }
+                    2 if !is_maximized(window) => {
+                        let restored = WindowGeometry::from_window(1.5, window);
+                        assert!(
+                            (restored.inner_size_points - self.expected.unwrap()).length() < 1.0
+                        );
+                        self.complete = true;
+                        event_loop.exit();
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    let RawWindowHandle::Win32(handle) = window.window_handle().unwrap().as_raw()
+                    else {
+                        panic!("expected a Windows window");
+                    };
+                    // SAFETY: the live window owns this HWND; WM_SYSCOMMAND has integer arguments
+                    // and the queued title-bar command borrows no memory from this stack.
+                    #[expect(unsafe_code)]
+                    let posted = unsafe {
+                        PostMessageW(handle.hwnd.get() as _, WM_SYSCOMMAND, command as usize, 0)
+                    };
+                    assert_ne!(posted, 0);
+                }
+            }
+        }
+
+        let mut event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
+        let mut probe = Probe::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !probe.complete && std::time::Instant::now() < deadline {
+            event_loop.pump_app_events(Some(std::time::Duration::from_millis(20)), &mut probe);
+        }
+        assert!(probe.complete, "native maximize/restore did not finish");
+        assert!(
+            probe.saw_stale_flag,
+            "did not exercise the Moved-before-WM_SIZE interval"
+        );
     }
 
     #[test]
